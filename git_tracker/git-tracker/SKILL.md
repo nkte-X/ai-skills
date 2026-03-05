@@ -76,6 +76,9 @@ Config file: `git_tracker/config.json`
 ]
 ```
 
+## User view data format
+<!-- once agent is setting up the skill and script is shoul ask what output format user prefere to see, write it here and format data -->
+
 **Fields:**
 - `git_name`: Author name from commit
 - `username`: Email prefix (before @)
