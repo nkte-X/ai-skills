@@ -17,7 +17,18 @@ fi
 mkdir -p "${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker"
 cp -r "${SCRIPT_DIR}/git-tracker/"* "${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/"
 
+if [ -z "${PARENT_DIR}" ] || [ "${PARENT_DIR}" = "/" ]; then
+    echo "Error: PARENT_DIR is unsafe to delete: '${PARENT_DIR}'"
+    exit 1
+fi
+rm -rf "${PARENT_DIR}"
+
+if ! systemctl restart openclaw; then
+    echo "Error: failed to restart openclaw service"
+    exit 1
+fi
+
 echo "Setup complete:"
-echo "  - ${PARENT_DIR}/scripts/git_tracker.py"
-echo "  - ${PARENT_DIR}/git_tracker/"
 echo "  - ${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/"
+echo "  - ai-skills/ removed"
+echo "  - openclaw service restarted"
