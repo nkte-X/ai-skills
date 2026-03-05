@@ -6,7 +6,7 @@ This document describes how to install the **git-tracker** skill into an OpenCla
 
 - Access to the OpenClaw instance filesystem
 - `OPENCLAW_WORKSPACE_DIR` environment variable set to the OpenClaw workspace root (e.g. `/opt/openclaw/workspace`)
-- The `ai-skills/` repository cloned on the target system
+- The `ai-skills/` repository cloned two levels below the OpenClaw root (i.e. `{rootdir}/ai-skills/`)
 
 ## Installation Steps
 
@@ -23,18 +23,16 @@ cp -r git_tracker/git-tracker/ "${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/"
 Copy the Python helper script to the OpenClaw root scripts directory.
 
 ```bash
-mkdir -p "${OPENCLAW_ROOT_DIR}/scripts"
-cp git_tracker/script/git_tracker.py "${OPENCLAW_ROOT_DIR}/scripts/"
+mkdir -p ../../scripts
+cp git_tracker/script/git_tracker.py ../../scripts/
 ```
-
-> `OPENCLAW_ROOT_DIR` is the root directory of the OpenClaw installation (one level above the workspace).
 
 ### 3. Recursively copy `git_tracker/` to `{rootdir}`
 
 Copy the full tracker module (config, data directory, etc.) to the OpenClaw root directory so the script can find its configuration at runtime.
 
 ```bash
-cp -r git_tracker/git_tracker/ "${OPENCLAW_ROOT_DIR}/"
+cp -r git_tracker/git_tracker/ ../../
 ```
 
 ### 4. Delete the `ai-skills/` folder
