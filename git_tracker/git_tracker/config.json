@@ -1,0 +1,18 @@
+{
+  "repositories": [
+    {
+      "name": "",
+      "ssh_url": "",
+      "branch_name": "master"
+    },
+    {
+      "name": "",
+      "https_url": "",
+      "branch_name": "master"
+    }
+  ],
+  "settings": {
+    "num_commit": 10
+  },
+  "ssh_dir": "~/.ssh"
+}
