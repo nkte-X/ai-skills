@@ -435,13 +435,14 @@ def fetch_git_log(
             raise RuntimeError(f"Failed to clone repository: {e.stderr}") from e
         
         # Fetch git log from cloned repo
+        # Fetch num_commits + 1 to account for the oldest commit having no previous timestamp
         git_format = "%an|%ae|%ad|%s"
         cmd = [
             "git",
             "--git-dir", str(temp_dir),
             "log",
             f"--format={git_format}",
-            f"-{num_commits}",
+            f"-{num_commits + 1}",
             "--date=iso",
             "--numstat",
         ]
@@ -472,10 +473,9 @@ def _parse_git_log(output: str, num_commits: int, user_email: str | None) -> lis
     Author Name2|email2@domain.com|timestamp2|Subject2
     ...
     """
-    commits: list[CommitStats] = []
+    # First pass: parse all commits without calculating spent_time
+    commits_without_time: list[dict] = []
     lines = output.strip().split("\n")
-    
-    prev_timestamp: datetime | None = None
     
     i = 0
     while i < len(lines):
@@ -521,43 +521,67 @@ def _parse_git_log(output: str, num_commits: int, user_email: str | None) -> lis
                         pass
                 i += 1
             
-            spent_time = ""
-            if prev_timestamp:
-                delta = timestamp - prev_timestamp
-                spent_time = _format_delta(delta)
-            
-            prev_timestamp = timestamp
-            
-            commits.append(CommitStats(
-                git_name=git_name,
-                username=username,
-                email=email,
-                rows_added=rows_added,
-                rows_removed=rows_removed,
-                spent_time=spent_time,
-                timestamp=timestamp,
-            ))
+            commits_without_time.append({
+                "git_name": git_name,
+                "username": username,
+                "email": email,
+                "rows_added": rows_added,
+                "rows_removed": rows_removed,
+                "timestamp": timestamp,
+            })
         else:
             i += 1
+    
+    # Reverse commits to chronological order (oldest first)
+    # This ensures positive time deltas between consecutive commits
+    commits_without_time.reverse()
+    
+    # Second pass: calculate spent_time in chronological order
+    commits: list[CommitStats] = []
+    prev_timestamp: datetime | None = None
+    
+    for commit_data in commits_without_time:
+        timestamp = commit_data["timestamp"]
+        spent_time = ""
+        if prev_timestamp:
+            delta = timestamp - prev_timestamp
+            spent_time = _format_delta(delta)
+        
+        prev_timestamp = timestamp
+        
+        commits.append(CommitStats(
+            git_name=commit_data["git_name"],
+            username=commit_data["username"],
+            email=commit_data["email"],
+            rows_added=commit_data["rows_added"],
+            rows_removed=commit_data["rows_removed"],
+            spent_time=spent_time,
+            timestamp=timestamp,
+        ))
+    
+    # If we fetched num_commits + 1 commits, drop the oldest one (has empty spent_time)
+    # This ensures we return exactly num_commits with valid spent_time data
+    if len(commits) > num_commits:
+        commits = commits[-num_commits:]
     
     return commits
 
 
 def _format_delta(delta: timedelta) -> str:
-    """Format timedelta into human-readable string."""
-    total_seconds = int(delta.total_seconds())
+    """Format timedelta into <XdXhXm> format string.
     
-    if total_seconds < 60:
-        return f"{total_seconds}s"
-    elif total_seconds < 3600:
-        minutes = total_seconds // 60
-        return f"{minutes}m"
-    elif total_seconds < 86400:
-        hours = total_seconds // 3600
-        return f"{hours}h"
-    else:
-        days = total_seconds // 86400
-        return f"{days}d"
+    Args:
+        delta: Time difference between commits.
+    
+    Returns:
+        String in format "<days>d<hours>h<minutes>m".
+        Example: 172800 seconds returns "2d0h0m".
+    """
+    total_seconds = int(abs(delta.total_seconds()))
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+    return f"{days}d{hours}h{minutes}m"
 
 
 def write_stats(commits: list[CommitStats], output_file: Path) -> None:

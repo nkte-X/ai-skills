@@ -39,8 +39,8 @@ Config file: `git_tracker/config.json`
 
 **Repository fields:**
 - `name` (required): Repository identifier
-- `ssh_url` (optional): SSH URL (git@host:path)
-- `https_url` (optional): HTTPS URL with optional token auth
+- `ssh_url` (optional): SSH URL (git@host:path) !HTTPS URL with optional token auth. Once user provide url validate if it ssh or https and save to correct field
+- `https_url` (optional): HTTPS URL with optional token auth. !HTTPS URL with optional token auth. Once user provide url validate if it ssh or https and save to correct field
 - `branch_name` (optional): Branch to fetch (default: default branch)
 - `user_email` (optional): Filter commits by author email
 
@@ -77,7 +77,8 @@ Config file: `git_tracker/config.json`
 ```
 
 ## User view data format
-<!-- once agent is setting up the skill and script is shoul ask what output format user prefere to see, write it here and format data -->
+<!-- once agent is setting up the skill and script is shoul ask what output format user prefere to see, write it here and format data.
+Counts the aproximate time spent for commit based on `spent_time` -->
 
 **Fields:**
 - `git_name`: Author name from commit
