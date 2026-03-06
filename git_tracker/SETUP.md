@@ -85,7 +85,7 @@ rm -rf ai-skills/
 
 After unpacking, the agent should ask the user what format they prefer for viewing git tracker data:
 
-**Interactive Question:**
+**Interactive Questions:**
 ```
 What format would you like to use for displaying git tracker statistics?
 
@@ -105,6 +105,16 @@ Options:
    ...,...,...,...,...
 
 4. Whatever user prefer
+
+What the user/commit author format is prefered?
+
+Options:
+1. DD-MM-YYYY
+2. DD-MM-YY
+3. YYYY-MM-DD
+4. custom format
+
+What datatime format is prefered?
 ```
 
 **Skill File Update:**
