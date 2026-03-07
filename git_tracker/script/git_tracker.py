@@ -55,7 +55,7 @@ class Repository:
 @dataclass
 class Settings:
     """Application settings."""
-    num_commit: int = 10
+    num_days: int = 10
 
 
 @dataclass
@@ -67,9 +67,16 @@ class Config:
 
 
 DEFAULT_CONFIG = """{
-  "repositories": [],
+  "repositories": [
+    {
+      "name": "",
+      "ssh_url": "",
+      "https_url": "",
+      "branch_name": ""
+    }
+  ],
   "settings": {
-    "num_commit": 10
+    "num_days": 1
   },
   "ssh_dir": "~/.ssh"
 }"""
@@ -128,7 +135,7 @@ def load_config() -> Config:
         ))
     
     settings = Settings(
-        num_commit=data.get("settings", {}).get("num_commit", 10)
+        num_days=data.get("settings", {}).get("num_days", 10)
     )
     
     ssh_dir = Path(data.get("ssh_dir", "~/.ssh")).expanduser()
@@ -373,6 +380,70 @@ def test_https_connection(https_url: str) -> tuple[bool, str]:
 # Git Operations
 # =============================================================================
 
+
+def get_recent_branches(
+    git_dir: Path,
+    num_days: int,
+    exclude_merged: bool = True,
+) -> list[str]:
+    """Get branches updated within the specified number of days.
+
+    Args:
+        git_dir: Path to the .git directory of the repository.
+        num_days: Number of days to look back for branch updates.
+        exclude_merged: If True, exclude branches that have been merged.
+
+    Returns:
+        List of branch names with recent activity.
+    """
+    now = datetime.now().astimezone()
+    cutoff_date = now - timedelta(days=num_days)
+
+    # Get all branches with their last commit dates
+    cmd = [
+        "git",
+        "--git-dir", str(git_dir),
+        "for-each-ref",
+        "--sort=-committerdate",
+        "--format=%(refname:short)|%(committerdate:iso)",
+        "refs/heads/",
+    ]
+
+    try:
+        result = run(cmd, capture_output=True, text=True, check=True)
+    except CalledProcessError as e:
+        print(f"Warning: Failed to get branches: {e.stderr}", file=sys.stderr)
+        return []
+
+    branches: list[str] = []
+
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+
+        branch_name = parts[0]
+        commit_date_str = parts[1]
+
+        try:
+            commit_date_str_stripped = commit_date_str.strip()
+            # Handle timezone-aware and naive datetimes
+            if "+" in commit_date_str_stripped or commit_date_str_stripped.endswith("Z"):
+                commit_date = datetime.fromisoformat(commit_date_str_stripped.replace("Z", "+00:00"))
+            else:
+                commit_date = datetime.fromisoformat(commit_date_str_stripped).astimezone()
+
+            # Check if branch was updated within num_days
+            if commit_date >= cutoff_date:
+                branches.append(branch_name)
+        except (ValueError, IndexError):
+            continue
+
+    return branches
+
 @dataclass
 class CommitStats:
     """Commit statistics."""
@@ -383,27 +454,28 @@ class CommitStats:
     rows_removed: int
     spent_time: str
     timestamp: datetime
+    branch: str = ""
     error: str = "-"
 
 
 def fetch_git_log(
     url: str,
-    num_commits: int = 10,
-    branch: str | None = None,
+    num_days: int,
+    branches: list[str] | None = None,
     user_email: str | None = None,
     ssh_key_dir: Path | None = None,
     is_ssh: bool = True,
 ) -> list[CommitStats]:
     """Fetch git log from remote repository via SSH or HTTPS.
-    
+
     Args:
         url: URL of the git repository (SSH or HTTPS).
-        num_commits: Number of recent commits to fetch.
-        branch: Branch name to fetch from (None = default branch).
+        num_days: Number of days to look back for commits.
+        branches: List of branch names to fetch from (None = auto-discover recent branches).
         user_email: Filter by author email (optional).
         ssh_key_dir: Path to SSH key directory (only used for SSH).
         is_ssh: Whether the URL is SSH (True) or HTTPS (False).
-    
+
     Returns:
         List of CommitStats objects.
     """
@@ -433,39 +505,67 @@ def fetch_git_log(
             clone_result = run(clone_cmd, capture_output=True, text=True, env=clone_env, check=True)
         except CalledProcessError as e:
             raise RuntimeError(f"Failed to clone repository: {e.stderr}") from e
-        
-        # Fetch git log from cloned repo
-        # Fetch num_commits + 1 to account for the oldest commit having no previous timestamp
-        git_format = "%an|%ae|%ad|%s"
-        cmd = [
-            "git",
-            "--git-dir", str(temp_dir),
-            "log",
-            f"--format={git_format}",
-            f"-{num_commits + 1}",
-            "--date=iso",
-            "--numstat",
-        ]
-        
-        if branch:
-            cmd.append(branch)
-        
-        try:
-            result = run(cmd, capture_output=True, text=True, check=True)
-        except CalledProcessError as e:
-            raise RuntimeError(f"Failed to fetch git log: {e.stderr}") from e
-        
-        return _parse_git_log(result.stdout, num_commits, user_email)
-    
+
+        # Determine which branches to process
+        if branches is None:
+            branches = get_recent_branches(temp_dir, num_days, exclude_merged=False)
+
+        # If no branches found or specified, use HEAD (all refs)
+        if not branches:
+            branches = ["HEAD"]
+
+        all_commits: list[CommitStats] = []
+        cutoff_date = datetime.now().astimezone() - timedelta(days=num_days)
+
+        for branch_name in branches:
+            # Fetch git log from cloned repo
+            git_format = "%an|%ae|%ad|%s"
+            cmd = [
+                "git",
+                "--git-dir", str(temp_dir),
+                "log",
+                f"--format={git_format}",
+                "--date=iso",
+                "--numstat",
+                "--no-merges",
+            ]
+
+            # Add branch to the command
+            cmd.append(branch_name)
+
+            try:
+                result = run(cmd, capture_output=True, text=True, check=True)
+                commits = _parse_git_log(result.stdout, branch_name, user_email)
+                all_commits.extend(commits)
+            except CalledProcessError as e:
+                print(f"Warning: Failed to fetch log for branch '{branch_name}': {e.stderr}", file=sys.stderr)
+                continue
+
+        # Sort all commits by timestamp
+        all_commits.sort(key=lambda c: c.timestamp)
+
+        # Filter commits by num_days
+        all_commits = [c for c in all_commits if c.timestamp >= cutoff_date]
+
+        # Calculate spent_time across all commits
+        prev_timestamp: datetime | None = None
+        for commit in all_commits:
+            if prev_timestamp:
+                delta = commit.timestamp - prev_timestamp
+                commit.spent_time = _format_delta(delta)
+            prev_timestamp = commit.timestamp
+
+        return all_commits
+
     finally:
         # Cleanup temp directory
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
 
 
-def _parse_git_log(output: str, num_commits: int, user_email: str | None) -> list[CommitStats]:
+def _parse_git_log(output: str, branch_name: str, user_email: str | None) -> list[CommitStats]:
     """Parse git log output into CommitStats objects.
-    
+
     Git log output format (--numstat):
     Author Name|email@domain.com|timestamp|Subject
     <added>\t<removed>\t<filename>    # one or more lines per commit
@@ -476,22 +576,22 @@ def _parse_git_log(output: str, num_commits: int, user_email: str | None) -> lis
     # First pass: parse all commits without calculating spent_time
     commits_without_time: list[dict] = []
     lines = output.strip().split("\n")
-    
+
     i = 0
     while i < len(lines):
         line = lines[i]
-        
+
         # Check if this is a commit header line (contains '|')
         if "|" in line:
             parts = line.split("|")
             if len(parts) < 4:
                 i += 1
                 continue
-            
+
             git_name = parts[0]
             email = parts[1]
             timestamp_str = parts[2]
-            
+
             # Filter by user_email if specified
             if user_email and email != user_email:
                 # Skip this commit entirely - move past all numstat lines
@@ -499,15 +599,20 @@ def _parse_git_log(output: str, num_commits: int, user_email: str | None) -> lis
                 while i < len(lines) and "|" not in lines[i]:
                     i += 1
                 continue
-            
+
             username = email.split("@")[0] if "@" in email else email
-            timestamp = datetime.fromisoformat(timestamp_str.strip())
-            
+            timestamp_str_stripped = timestamp_str.strip()
+            # Handle timezone-aware and naive datetimes
+            if "+" in timestamp_str_stripped or timestamp_str_stripped.endswith("Z"):
+                timestamp = datetime.fromisoformat(timestamp_str_stripped.replace("Z", "+00:00"))
+            else:
+                timestamp = datetime.fromisoformat(timestamp_str_stripped).astimezone()
+
             # Parse all numstat lines for this commit
             rows_added = 0
             rows_removed = 0
             i += 1
-            
+
             while i < len(lines) and "|" not in lines[i]:
                 numstat_line = lines[i]
                 if numstat_line and "\t" in numstat_line:
@@ -520,7 +625,7 @@ def _parse_git_log(output: str, num_commits: int, user_email: str | None) -> lis
                     except (ValueError, IndexError):
                         pass
                 i += 1
-            
+
             commits_without_time.append({
                 "git_name": git_name,
                 "username": username,
@@ -528,27 +633,28 @@ def _parse_git_log(output: str, num_commits: int, user_email: str | None) -> lis
                 "rows_added": rows_added,
                 "rows_removed": rows_removed,
                 "timestamp": timestamp,
+                "branch": branch_name,
             })
         else:
             i += 1
-    
+
     # Reverse commits to chronological order (oldest first)
     # This ensures positive time deltas between consecutive commits
     commits_without_time.reverse()
-    
+
     # Second pass: calculate spent_time in chronological order
     commits: list[CommitStats] = []
     prev_timestamp: datetime | None = None
-    
+
     for commit_data in commits_without_time:
         timestamp = commit_data["timestamp"]
         spent_time = ""
         if prev_timestamp:
             delta = timestamp - prev_timestamp
             spent_time = _format_delta(delta)
-        
+
         prev_timestamp = timestamp
-        
+
         commits.append(CommitStats(
             git_name=commit_data["git_name"],
             username=commit_data["username"],
@@ -557,13 +663,9 @@ def _parse_git_log(output: str, num_commits: int, user_email: str | None) -> lis
             rows_removed=commit_data["rows_removed"],
             spent_time=spent_time,
             timestamp=timestamp,
+            branch=commit_data["branch"],
         ))
-    
-    # If we fetched num_commits + 1 commits, drop the oldest one (has empty spent_time)
-    # This ensures we return exactly num_commits with valid spent_time data
-    if len(commits) > num_commits:
-        commits = commits[-num_commits:]
-    
+
     return commits
 
 
@@ -600,6 +702,7 @@ def write_stats(commits: list[CommitStats], output_file: Path) -> None:
             "rows_removed": c.rows_removed,
             "spent_time": c.spent_time,
             "timestamp": c.timestamp.isoformat(),
+            "branch": c.branch,
             "error": c.error,
         }
         for c in commits
@@ -646,34 +749,34 @@ def get_stats_output_filename() -> Path:
 
 def process_repository(
     repo: Repository,
-    num_commits: int,
-    ssh_key_dir: Path,
+    num_days: int,
+    ssh_key_dir: Path | None = None,
 ) -> list[CommitStats]:
     """Process a single repository.
-    
+
     Args:
         repo: Repository configuration.
-        num_commits: Number of commits to fetch.
+        num_days: Number of days to look back for commits.
         ssh_key_dir: Path to SSH key directory (only used for SSH).
-    
+
     Returns:
         List of commit statistics.
     """
     print(f"Processing repository: {repo.name}")
-    
+
     url = repo.get_url()
     is_ssh = repo.is_ssh()
-    
+
     # Test connection based on URL type
     if is_ssh:
         print(f"  SSH URL: {url}")
         host = extract_ssh_host(url)
-        success, error_msg = test_ssh_connection(host, ssh_key_dir)
+        success, error_msg = test_ssh_connection(host, ssh_key_dir if ssh_key_dir else get_ssh_key_dir())
     else:
         print(f"  HTTPS URL: {url}")
         success, error_msg = test_https_connection(url)
-    
-    print(f"  Branch: {repo.branch_name or 'default'}")
+
+    print(f"  Using num_days: {num_days}")
 
     if not success:
         print(f"  Connection test failed: {error_msg}")
@@ -684,40 +787,44 @@ def process_repository(
             rows_added=0,
             rows_removed=0,
             spent_time="",
-            timestamp=datetime.now(),
+            timestamp=datetime.now().astimezone(),
             error=error_msg,
         )
         return [error_entry]
 
     commits = fetch_git_log(
         url=url,
-        num_commits=num_commits,
-        branch=repo.branch_name,
+        num_days=num_days,
+        branches=[repo.branch_name] if repo.branch_name else None,
         user_email=repo.user_email,
-        ssh_key_dir=ssh_key_dir if is_ssh else None,
+        ssh_key_dir=ssh_key_dir if ssh_key_dir and is_ssh else (get_ssh_key_dir() if is_ssh else None),
         is_ssh=is_ssh,
     )
 
     return commits
 
 
-def process_all_repos(config: Config) -> dict[str, list[dict]]:
+def process_all_repos(config: Config, num_days: int | None = None) -> dict[str, list[dict]]:
     """Process all repositories from config.
-    
+
     Args:
         config: Configuration object.
-    
+        num_days: Number of days to look back (None = use config setting).
+
     Returns:
         Dictionary mapping repo names to their commits.
     """
     ssh_key_dir = get_ssh_key_dir()
     results = {}
-    
+
+    # Use CLI argument if provided, otherwise use config setting
+    days_to_use = num_days if num_days is not None else config.settings.num_days
+
     for repo in config.repositories:
         try:
             commits = process_repository(
                 repo=repo,
-                num_commits=config.settings.num_commit,
+                num_days=days_to_use,
                 ssh_key_dir=ssh_key_dir,
             )
             # Convert to dict for JSON serialization
@@ -730,6 +837,7 @@ def process_all_repos(config: Config) -> dict[str, list[dict]]:
                     "rows_removed": c.rows_removed,
                     "spent_time": c.spent_time,
                     "timestamp": c.timestamp.isoformat(),
+                    "branch": c.branch,
                     "error": "-",
                 }
                 for c in commits
@@ -746,6 +854,7 @@ def process_all_repos(config: Config) -> dict[str, list[dict]]:
                     "rows_removed": 0,
                     "spent_time": "",
                     "timestamp": "",
+                    "branch": "",
                     "error": error_message,
                 }
             ]
@@ -795,10 +904,10 @@ def main() -> dict[str, list[dict]]:
         help="Process specific repository by name",
     )
     parser.add_argument(
-        "--num-commits",
+        "--num-days",
         type=int,
         default=10,
-        help="Number of commits to fetch (default: 10)",
+        help="Number of days to look back for commits (default: 10)",
     )
     parser.add_argument(
         "--init",
@@ -827,8 +936,8 @@ def main() -> dict[str, list[dict]]:
             print(f"SSH key dir: {get_ssh_key_dir()}")
             print(f"Repositories ({len(config.repositories)}):")
             for repo in config.repositories:
-                print(f"  - {repo.name}: {repo.ssh_url}")
-            print(f"Default num_commits: {config.settings.num_commit}")
+                print(f"  - {repo.name}: {repo.ssh_url or repo.https_url}")
+            print(f"Default num_days: {config.settings.num_days}")
         except FileNotFoundError:
             print("No config found. Run --init to create one.")
         return {}
@@ -843,18 +952,18 @@ def main() -> dict[str, list[dict]]:
     
     # Process repos
     if args.all:
-        return process_all_repos(config)
+        return process_all_repos(config, args.num_days)
     elif args.repo:
         # Find specific repo
         repo = next((r for r in config.repositories if r.name == args.repo), None)
         if repo is None:
             print(f"Error: Repository '{args.repo}' not found in config.", file=sys.stderr)
             sys.exit(1)
-        
+
         ssh_key_dir = get_ssh_key_dir()
         commits = process_repository(
             repo=repo,
-            num_commits=args.num_commits,
+            num_days=args.num_days,
             ssh_key_dir=ssh_key_dir,
         )
         return {
@@ -867,6 +976,7 @@ def main() -> dict[str, list[dict]]:
                     "rows_removed": c.rows_removed,
                     "spent_time": c.spent_time,
                     "timestamp": c.timestamp.isoformat(),
+                    "branch": c.branch,
                 }
                 for c in commits
             ]

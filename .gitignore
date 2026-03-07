@@ -6,3 +6,4 @@ AGENTS.md
 __pycache__/
 data/*
 test_*
+.dev/
