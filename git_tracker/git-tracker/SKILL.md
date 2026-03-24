@@ -1,6 +1,10 @@
 ---
 name: git-tracker
-description: Track developer activity from remote git repositories via SSH or HTTPS. Use to fetch git statistics including git name, username, rows added, rows removed, and time between commits (spent time). Supports both SSH and HTTPS URLs, configurable SSH key directory, email filtering. Writes daily statistics to ROOT_DIR/git_tracker/data/ with date-based filenames. Returns formatted output based on user preferences set during setup. Integrates with OpenClaw for formatting and pushing to communication channels. Use when agent needs to track git activity, generate reports, or analyze developer contributions.
+description: Fetch developer commit statistics from remote git repositories via SSH or HTTPS. Runs a Python script that outputs JSON with author name, lines added/removed, time spent per commit, and branch info. Use this skill whenever the user or a cron job asks for git activity reports, developer contribution summaries, code review stats, or daily standups based on git data. Supports approximate time estimation (caps overnight/weekend gaps at 8h). Always use --approximate flag for human-readable reports. Triggered by cron daily at 08:00 CET.
+compatibility: Requires Python 3.9+, git CLI, and SSH access for SSH repositories
+metadata:
+  author: nkte-X
+  version: "1.1"
 ---
 
 # Git Tracker Skill
@@ -10,36 +14,37 @@ Fetch and track developer activity from remote git repositories via SSH or HTTPS
 ## Quick Start
 
 ```bash
-python3 script/git_tracker.py --all
-python3 script/git_tracker.py --repo <name>
-python3 script/git_tracker.py --show-config
-python3 script/git_tracker.py --init
+python3 ${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/scripts/git_tracker.py --all --approximate
+python3 ${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/scripts/git_tracker.py --repo <name> --approximate
+python3 ${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/scripts/git_tracker.py --show-config
 ```
 
 ## Directory Structure
 
 ```
-ROOT_DIR/                           # Main OpenClaw agent root (ROOT_EXEC dir)
-├── scripts/
-│   └── git_tracker.py              # Main script (execute from ROOT_DIR)
-├── git_tracker/
-│   ├── config.json                 # Repository configuration (PRESERVED on update)
-│   └── data/                       # Daily statistics files (PRESERVED on update)
-│       └── stats_{dd_mm_yyyy}.json # Stats file with creation date
-OPENCLAW_WORKSPACE_DIR/
-└── skills/
-    └── git-tracker/
-        └── SKILL.md                # This skill file
+OPENCLAW_WORKSPACE_DIR/                 # ~/.openclaw/workspace/ by default
+├── skills/
+│   └── git-tracker/                    # Skill directory (replaceable on update)
+│       ├── SKILL.md                    # This skill file
+│       ├── scripts/
+│       │   └── git_tracker.py          # Main script
+│       └── references/
+│           └── UPDATE.md               # Update procedure
+└── git_tracker/                        # Persistent data (PRESERVED on update)
+    ├── config.json                     # Repository configuration
+    ├── config-example.json             # Example config template
+    └── data/                           # Daily statistics files
+        └── stats_{dd_mm_yyyy}.json
 ```
 
-**Important directories:**
-- `ROOT_DIR`: Main OpenClaw agent root directory (execution directory)
-- `OPENCLAW_WORKSPACE_DIR`: OpenClaw workspace for skills (`~/.openclaw/workspace/` by default)
-- Config and data directories in `ROOT_DIR/git_tracker/` are preserved during updates
+**Important:**
+- `OPENCLAW_WORKSPACE_DIR`: OpenClaw workspace (`~/.openclaw/workspace/` by default)
+- `skills/git-tracker/` is replaceable on update — safe to overwrite
+- `git_tracker/` (config + data) is persistent — never overwrite during updates
 
 ## Configuration
 
-Config file: `ROOT_DIR/git_tracker/config.json`
+Config file: `${OPENCLAW_WORKSPACE_DIR}/git_tracker/config.json`
 
 ```json
 {
@@ -74,23 +79,22 @@ Config file: `ROOT_DIR/git_tracker/config.json`
 
 ## CLI Options
 
-Execute script from `ROOT_DIR/scripts/`:
+Execute from the skill's scripts directory:
 
 ```bash
-cd ROOT_DIR
-python3 scripts/git_tracker.py --all
-python3 scripts/git_tracker.py --repo <name>
-python3 scripts/git_tracker.py --show-config
-python3 scripts/git_tracker.py --init
+python3 ${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/scripts/git_tracker.py --all --approximate
+python3 ${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/scripts/git_tracker.py --repo <name>
+python3 ${OPENCLAW_WORKSPACE_DIR}/skills/git-tracker/scripts/git_tracker.py --show-config
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--all` | Process all repositories from config |
 | `--repo <name>` | Process specific repository |
-| `--num-days <n>` | Number of days to look back (default: 10) |
+| `--num-days <n>` | Number of days to look back (default: from config.json) |
 | `--init` | Create default config |
 | `--show-config` | Display current configuration |
+| `--approximate` | Cap spent_time at 8h workday, flag approximate entries |
 
 ## Output Data Schema
 
@@ -108,7 +112,8 @@ Script returns JSON structure:
       "spent_time": "0d2h30m",
       "timestamp": "2025-03-06T10:30:00+01:00",
       "branch": "main",
-      "error": "-"
+      "error": "-",
+      "approximate": false
     }
   ]
 }
@@ -124,86 +129,72 @@ Script returns JSON structure:
 - `timestamp`: Commit timestamp (ISO format)
 - `branch`: Branch name
 - `error`: Error message or "-" for success
+- `approximate`: Boolean — `true` when `spent_time` was capped at 8h (raw delta exceeded a workday), `false` when `spent_time` is the actual inter-commit delta
 
-## User Output Format Settings
+## Approximate Time Heuristics
 
-When setting up the skill, agent must ask user for output format preferences:
+When `approximate` is `true`, `spent_time` shows `0d8h0m` (the cap) — the real gap was longer but included non-working time. Estimate actual work time from `rows_added + rows_removed`:
 
-**Question 1: Output Data Format**
-```
-What format would you like to use for displaying git tracker statistics?
+| Lines changed (added+removed) | Estimated work time | Example |
+|-------------------------------|--------------------:|---------|
+| 1-10                          | ~15-30min           | 5 lines → "~20min" |
+| 11-30                         | ~30min-1h           | 20 lines → "~45min" |
+| 31-100                        | ~1-4h               | 60 lines → "~2h" |
+| 100+                          | ~4-8h               | 200 lines → "~6h" |
 
-Options:
-1. Markdown table
-2. JSON format
-3. CSV format
-4. Custom format (specify)
+Rules:
+- When `approximate` is `true`: use the table above, prefix with "~"
+- When `approximate` is `false`: use exact `spent_time` value as-is
+- When `spent_time` is empty: this is the first commit in the window, show "-" or omit
 
-Examples:
-Markdown:
-| date | repo_name | rows_added | rows_removed | username | branch | spent_time |
-|------|-----------|------------|--------------|----------|--------|------------|
-| 06.03.2026 | backend | +70 | -20 | Alex | main | 0d2h30m |
+## Output Formatting Rules
 
-JSON:
-[{"date": "06.03.2026", "repo_name": "backend", "rows_added": 70, "rows_removed": 20, "username": "Alex", "branch": "main", "spent_time": "2h30m"}]
-```
+When presenting git tracker data to the user, follow these rules exactly:
 
-**Question 2: Date Format**
-```
-What date format do you prefer?
+1. **Run the script** with `--approximate` flag (always, unless user explicitly asks for raw data)
+2. **Read the JSON output** from the daily stats file or stdout
+3. **Format each entry** using the template in "User Output Format" below
+4. **Sort order**: entries are already sorted newest-first by the script
+5. **Group by date**: group entries by calendar date, show date as header
+6. **Approximate handling**:
+   - If `approximate: false` → show `spent_time` exactly as-is (e.g., "0d2h30m" → "2h 30m")
+   - If `approximate: true` → calculate from lines changed using the heuristics table above, prefix with "~"
+   - If `spent_time` is empty → show "-"
+7. **Human-readable spent_time**: strip leading zeros and "d" when days=0 (e.g., "0d2h30m" → "2h 30m", "1d3h0m" → "1d 3h")
 
-Options:
-1. DD-MM-YYYY
-2. DD-MM-YY
-3. YYYY-MM-DD
-4. Custom (specify)
-```
+**Example transformations:**
 
-**Question 3: Author Name Format**
-```
-How should the author be displayed?
+Input: `{"rows_added": 36, "rows_removed": 12, "spent_time": "0d8h0m", "approximate": true}`
+Output: spent_time shown as "~2-3h" (48 lines changed → medium range)
 
-Options:
-1. Username (email prefix)
-2. Full name
-3. Email address
-4. Custom format (specify)
-```
+Input: `{"rows_added": 3, "rows_removed": 2, "spent_time": "0d0h10m", "approximate": false}`
+Output: spent_time shown as "10m" (exact, not approximate)
 
-**After user selects preferences:**
-1. Add "User Output Format" section to this SKILL.md with the selected format
-2. Agent MUST always format output according to these settings
-3. Apply date format to `timestamp` field
-4. Apply author format to `username` field
-5. Format `spent_time` as approximate time spent for commit
+## User Output Format Setup
+
+If the "User Output Format" section below still shows `[USER_PREFERENCES_HERE]`, ask the user these questions on first interaction:
+
+1. **Output format**: Markdown table / JSON / CSV / Custom
+2. **Date format**: DD.MM.YYYY / DD-MM-YY / YYYY-MM-DD / Custom
+3. **Author display**: Username (email prefix) / Full name / Email / Custom
+
+Then update the section below with their choices and a concrete template.
 
 ## User Output Format
 
 [USER_PREFERENCES_HERE]
 
-<!-- 
-Example format for user preferences (update this section during setup):
+<!--
+Example (replace placeholder above with user's actual preferences):
 
 **Output Format:** Markdown table
-
-**Date Format:** DD-MM-YYYY
-
+**Date Format:** DD.MM.YYYY
 **Author Format:** Username (email prefix)
 
-**Table Template:**
-| date | repo_name | rows_added | rows_removed | username | branch | spent_time |
-|------|-----------|------------|--------------|----------|--------|------------|
-| {date} | {repo_name} | +{rows_added} | -{rows_removed} | {username} | {branch} | {spent_time} |
-
-**Field Mappings:**
-- date: timestamp formatted as DD-MM-YYYY
-- repo_name: repository name from config
-- rows_added: rows_added (with + prefix)
-- rows_removed: rows_removed (with - prefix)
-- username: email prefix (before @)
-- branch: branch name
-- spent_time: approximate time spent based on spent_time field
+**Template:**
+| date | repo | +lines | -lines | author | branch | time |
+|------|------|--------|--------|--------|--------|------|
+| {DD.MM.YYYY} | {repo_name} | +{rows_added} | -{rows_removed} | {username} | {branch} | {spent_time_formatted} |
 -->
 
 ## Error Handling
@@ -227,29 +218,10 @@ Example format for user preferences (update this section during setup):
 
 - Clones repositories temporarily to fetch logs
 - Automatically cleans up temp directories
-- Outputs daily stats to `ROOT_DIR/git_tracker/data/stats_{dd_mm_yyyy}.json` with creation date in filename
+- Outputs daily stats to `${OPENCLAW_WORKSPACE_DIR}/git_tracker/data/stats_{dd_mm_yyyy}.json` with creation date in filename
 - All entries from all repos are merged into single daily file
 - Agent must format script output according to user preferences in "User Output Format" section
 
-## Skill Update Procedure
+## Updating
 
-When updating to a new version of the skill:
-
-1. **Update Python script:**
-   ```bash
-   cp git_tracker/script/git_tracker.py ROOT_DIR/scripts/
-   ```
-
-2. **Update skill file:**
-   ```bash
-   cp git_tracker/git-tracker/SKILL.md OPENCLAW_WORKSPACE_DIR/skills/git-tracker/
-   ```
-
-3. **PRESERVE user settings:**
-   - Keep `ROOT_DIR/git_tracker/config.json` unchanged
-   - Keep `ROOT_DIR/git_tracker/data/` directory unchanged
-   - When updating SKILL.md, preserve the "User Output Format" section
-
-4. **Restart OpenClaw** to load updated skill
-
-**Important:** Never overwrite `config.json` or `data/` directory during updates as they contain user-specific configurations and accumulated statistics.
+See [references/UPDATE.md](references/UPDATE.md) for the full update procedure.

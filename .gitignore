@@ -1,9 +1,22 @@
 node_modules/
 bun.lock
 AGENTS.md
+CLAUDE.md
 .opencode/
+.claude/
+.superpowers/
 .sisyphus/
 __pycache__/
-data/*
 test_*
 .dev/
+
+config.json
+!config-example.json
+
+# git tracker
+git_tracker/git_tracker/data/*
+
+# other repos
+agent-manager/
+win-manager/
+openclaw-manager-opencode/
