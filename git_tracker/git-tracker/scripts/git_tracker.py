@@ -2,10 +2,10 @@
 """Git activity tracker - fetches remote git repository data via SSH.
 
 Usage:
-    python script/git_tracker.py --all              # Process all repos from config
-    python script/git_tracker.py --repo <name>     # Process specific repo
-    python script/git_tracker.py --init            # Create default config
-    python script/git_tracker.py --show-config     # Show current configuration
+    python scripts/git_tracker.py --all              # Process all repos from config
+    python scripts/git_tracker.py --repo <name>     # Process specific repo
+    python scripts/git_tracker.py --init            # Create default config
+    python scripts/git_tracker.py --show-config     # Show current configuration
 """
 
 import argparse
@@ -27,7 +27,20 @@ from subprocess import CalledProcessError, run
 # =============================================================================
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-CONFIG_DIR = SCRIPT_DIR.parent / "git_tracker"
+
+# Resolve config directory:
+# 1. OPENCLAW_WORKSPACE_DIR env var (explicit override)
+# 2. Auto-detect workspace (walk up from skills/git-tracker/scripts/)
+# 3. Dev fallback (relative ../../git_tracker)
+_workspace_env = os.environ.get("OPENCLAW_WORKSPACE_DIR")
+if _workspace_env:
+    CONFIG_DIR = Path(_workspace_env) / "git_tracker"
+else:
+    _workspace_candidate = SCRIPT_DIR.parent.parent.parent.parent
+    if (_workspace_candidate / "skills" / "git-tracker" / "SKILL.md").is_file():
+        CONFIG_DIR = _workspace_candidate / "git_tracker"
+    else:
+        CONFIG_DIR = SCRIPT_DIR.parent.parent / "git_tracker"
 
 
 @dataclass
@@ -456,6 +469,8 @@ class CommitStats:
     timestamp: datetime
     branch: str = ""
     error: str = "-"
+    approximate: bool = False
+    commit_hash: str = ""
 
 
 def fetch_git_log(
@@ -465,6 +480,7 @@ def fetch_git_log(
     user_email: str | None = None,
     ssh_key_dir: Path | None = None,
     is_ssh: bool = True,
+    approximate: bool = False,
 ) -> list[CommitStats]:
     """Fetch git log from remote repository via SSH or HTTPS.
 
@@ -519,7 +535,7 @@ def fetch_git_log(
 
         for branch_name in branches:
             # Fetch git log from cloned repo
-            git_format = "%an|%ae|%ad|%s"
+            git_format = "%H|%an|%ae|%ad|%s"
             cmd = [
                 "git",
                 "--git-dir", str(temp_dir),
@@ -541,19 +557,52 @@ def fetch_git_log(
                 print(f"Warning: Failed to fetch log for branch '{branch_name}': {e.stderr}", file=sys.stderr)
                 continue
 
-        # Sort all commits by timestamp
+        # Sort all commits by timestamp (ascending)
         all_commits.sort(key=lambda c: c.timestamp)
 
-        # Filter commits by num_days
-        all_commits = [c for c in all_commits if c.timestamp >= cutoff_date]
+        # Use wider window for spent_time context, then filter to output window
+        context_cutoff = datetime.now().astimezone() - timedelta(days=num_days + 1)
+        output_cutoff = datetime.now().astimezone() - timedelta(days=num_days)
+        all_commits = [c for c in all_commits if c.timestamp >= context_cutoff]
 
-        # Calculate spent_time across all commits
+        # Deduplicate by commit hash (same commit on multiple branches)
+        seen: dict[str, CommitStats] = {}
+        deduped: list[CommitStats] = []
+        for c in all_commits:
+            if c.commit_hash in seen:
+                seen[c.commit_hash].branch += f", {c.branch}"
+            else:
+                seen[c.commit_hash] = c
+                deduped.append(c)
+        all_commits = deduped
+
+        # Reset spent_time from per-branch calculation
+        for commit in all_commits:
+            commit.spent_time = ""
+            commit.approximate = False
+
+        # Calculate spent_time across all commits (chronological order)
+        max_workday = timedelta(hours=8)
         prev_timestamp: datetime | None = None
         for commit in all_commits:
             if prev_timestamp:
                 delta = commit.timestamp - prev_timestamp
-                commit.spent_time = _format_delta(delta)
+                if approximate and delta > max_workday:
+                    commit.spent_time = _format_delta(max_workday)
+                    commit.approximate = True
+                else:
+                    commit.spent_time = _format_delta(delta)
             prev_timestamp = commit.timestamp
+
+        # Default empty spent_time on first commit
+        if all_commits and not all_commits[0].spent_time:
+            all_commits[0].spent_time = "0d0h0m"
+
+        # Filter to output window (drop the context day)
+        all_commits = [c for c in all_commits if c.timestamp >= output_cutoff]
+
+        # Reverse to newest-first for output
+        all_commits.reverse()
 
         return all_commits
 
@@ -567,10 +616,10 @@ def _parse_git_log(output: str, branch_name: str, user_email: str | None) -> lis
     """Parse git log output into CommitStats objects.
 
     Git log output format (--numstat):
-    Author Name|email@domain.com|timestamp|Subject
+    hash|Author Name|email@domain.com|timestamp|Subject
     <added>\t<removed>\t<filename>    # one or more lines per commit
     <added>\t<removed>\t<filename>
-    Author Name2|email2@domain.com|timestamp2|Subject2
+    hash2|Author Name2|email2@domain.com|timestamp2|Subject2
     ...
     """
     # First pass: parse all commits without calculating spent_time
@@ -584,13 +633,14 @@ def _parse_git_log(output: str, branch_name: str, user_email: str | None) -> lis
         # Check if this is a commit header line (contains '|')
         if "|" in line:
             parts = line.split("|")
-            if len(parts) < 4:
+            if len(parts) < 5:
                 i += 1
                 continue
 
-            git_name = parts[0]
-            email = parts[1]
-            timestamp_str = parts[2]
+            commit_hash = parts[0]
+            git_name = parts[1]
+            email = parts[2]
+            timestamp_str = parts[3]
 
             # Filter by user_email if specified
             if user_email and email != user_email:
@@ -627,6 +677,7 @@ def _parse_git_log(output: str, branch_name: str, user_email: str | None) -> lis
                 i += 1
 
             commits_without_time.append({
+                "commit_hash": commit_hash,
                 "git_name": git_name,
                 "username": username,
                 "email": email,
@@ -664,6 +715,7 @@ def _parse_git_log(output: str, branch_name: str, user_email: str | None) -> lis
             spent_time=spent_time,
             timestamp=timestamp,
             branch=commit_data["branch"],
+            commit_hash=commit_data["commit_hash"],
         ))
 
     return commits
@@ -704,6 +756,7 @@ def write_stats(commits: list[CommitStats], output_file: Path) -> None:
             "timestamp": c.timestamp.isoformat(),
             "branch": c.branch,
             "error": c.error,
+            "approximate": c.approximate,
         }
         for c in commits
     ]
@@ -751,6 +804,7 @@ def process_repository(
     repo: Repository,
     num_days: int,
     ssh_key_dir: Path | None = None,
+    approximate: bool = False,
 ) -> list[CommitStats]:
     """Process a single repository.
 
@@ -799,12 +853,13 @@ def process_repository(
         user_email=repo.user_email,
         ssh_key_dir=ssh_key_dir if ssh_key_dir and is_ssh else (get_ssh_key_dir() if is_ssh else None),
         is_ssh=is_ssh,
+        approximate=approximate,
     )
 
     return commits
 
 
-def process_all_repos(config: Config, num_days: int | None = None) -> dict[str, list[dict]]:
+def process_all_repos(config: Config, num_days: int | None = None, approximate: bool = False) -> dict[str, list[dict]]:
     """Process all repositories from config.
 
     Args:
@@ -826,6 +881,7 @@ def process_all_repos(config: Config, num_days: int | None = None) -> dict[str, 
                 repo=repo,
                 num_days=days_to_use,
                 ssh_key_dir=ssh_key_dir,
+                approximate=approximate,
             )
             # Convert to dict for JSON serialization
             results[repo.name] = [
@@ -839,6 +895,7 @@ def process_all_repos(config: Config, num_days: int | None = None) -> dict[str, 
                     "timestamp": c.timestamp.isoformat(),
                     "branch": c.branch,
                     "error": "-",
+                    "approximate": c.approximate,
                 }
                 for c in commits
             ]
@@ -906,8 +963,8 @@ def main() -> dict[str, list[dict]]:
     parser.add_argument(
         "--num-days",
         type=int,
-        default=10,
-        help="Number of days to look back for commits (default: 10)",
+        default=None,
+        help="Number of days to look back (default: from config)",
     )
     parser.add_argument(
         "--init",
@@ -918,6 +975,11 @@ def main() -> dict[str, list[dict]]:
         "--show-config",
         action="store_true",
         help="Show current configuration",
+    )
+    parser.add_argument(
+        "--approximate",
+        action="store_true",
+        help="Cap spent_time at 8h workday, flag approximate entries",
     )
     
     args = parser.parse_args()
@@ -952,7 +1014,7 @@ def main() -> dict[str, list[dict]]:
     
     # Process repos
     if args.all:
-        return process_all_repos(config, args.num_days)
+        return process_all_repos(config, args.num_days, approximate=args.approximate)
     elif args.repo:
         # Find specific repo
         repo = next((r for r in config.repositories if r.name == args.repo), None)
@@ -965,6 +1027,7 @@ def main() -> dict[str, list[dict]]:
             repo=repo,
             num_days=args.num_days,
             ssh_key_dir=ssh_key_dir,
+            approximate=args.approximate,
         )
         return {
             repo.name: [
@@ -977,6 +1040,7 @@ def main() -> dict[str, list[dict]]:
                     "spent_time": c.spent_time,
                     "timestamp": c.timestamp.isoformat(),
                     "branch": c.branch,
+                    "approximate": c.approximate,
                 }
                 for c in commits
             ]
