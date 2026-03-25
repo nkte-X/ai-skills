@@ -9,21 +9,25 @@ Source repository: `https://github.com/nkte-X/ai-skills.git` (branch: master)
    cd /tmp && git clone https://github.com/nkte-X/ai-skills.git git_tracker_update
    ```
 
-2. **Backup current User Output Format section** from SKILL.md (copy the text between `## User Output Format` and the next `##` heading)
+2. **Backup current User Output Format section** from `skills/git-tracker/SKILL.md` (copy the text between `## User Output Format` and the next `##` heading)
 
-3. **Update skill directory (SKILL.md, scripts/, references/):**
+3. **Update skill directory (SKILL.md, scripts/, references/, assets/):**
    ```bash
-   cp -r /tmp/git_tracker_update/git_tracker/git-tracker/ OPENCLAW_WORKSPACE_DIR/skills/git-tracker
+   cp -r /tmp/git_tracker_update/git_tracker/git-tracker/* skills/git-tracker/
    ```
 
-4. **Restore User Output Format section** — paste the backed-up preferences into the new SKILL.md, replacing `[USER_PREFERENCES_HERE]`
+4. **Restore User Output Format section** -- paste the backed-up preferences into the new SKILL.md, replacing `[USER_PREFERENCES_HERE]`
 
-5. **NEVER overwrite:**
-   - `ROOT_DIR/git_tracker/config.json` — user-specific repository configuration
-   - `ROOT_DIR/git_tracker/data/` — accumulated statistics
+5. **Config and data are safe** -- they live at `~/git-tracker/` (outside the skill directory) and are not affected by updates.
 
 6. **Cleanup and restart:**
    ```bash
    rm -rf /tmp/git_tracker_update
    openclaw restart
+   ```
+
+7. **Verify:**
+   ```bash
+   python3 skills/git-tracker/scripts/git_tracker.py --show-config
+   python3 skills/git-tracker/scripts/git_tracker.py --all --approximate
    ```

@@ -2,10 +2,10 @@
 """Git activity tracker - fetches remote git repository data via SSH.
 
 Usage:
-    python scripts/git_tracker.py --all              # Process all repos from config
-    python scripts/git_tracker.py --repo <name>     # Process specific repo
-    python scripts/git_tracker.py --init            # Create default config
-    python scripts/git_tracker.py --show-config     # Show current configuration
+    python scripts/git_tracker.py --all --approximate   # Process all repos from config
+    python scripts/git_tracker.py --repo <name>         # Process specific repo
+    python scripts/git_tracker.py --init                # Create default config
+    python scripts/git_tracker.py --show-config         # Show current configuration
 """
 
 import argparse
@@ -29,18 +29,16 @@ from subprocess import CalledProcessError, run
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
 # Resolve config directory:
-# 1. OPENCLAW_WORKSPACE_DIR env var (explicit override)
-# 2. Auto-detect workspace (walk up from skills/git-tracker/scripts/)
-# 3. Dev fallback (relative ../../git_tracker)
-_workspace_env = os.environ.get("OPENCLAW_WORKSPACE_DIR")
-if _workspace_env:
-    CONFIG_DIR = Path(_workspace_env) / "git_tracker"
+# 1. GIT_TRACKER_CONFIG_DIR env var (explicit override, dev/testing)
+# 2. ~/git-tracker/ (default — outside skill dir for persistence)
+_config_env = os.environ.get("GIT_TRACKER_CONFIG_DIR")
+
+if _config_env:
+    CONFIG_DIR = Path(_config_env)
 else:
-    _workspace_candidate = SCRIPT_DIR.parent.parent.parent.parent
-    if (_workspace_candidate / "skills" / "git-tracker" / "SKILL.md").is_file():
-        CONFIG_DIR = _workspace_candidate / "git_tracker"
-    else:
-        CONFIG_DIR = SCRIPT_DIR.parent.parent / "git_tracker"
+    CONFIG_DIR = Path.home() / "git-tracker"
+
+CURRENT_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -80,6 +78,7 @@ class Config:
 
 
 DEFAULT_CONFIG = """{
+  "_schema_version": 1,
   "repositories": [
     {
       "name": "",
@@ -107,23 +106,38 @@ def get_data_dir() -> Path:
     return data_dir
 
 
+def migrate_config(data: dict) -> dict:
+    """Migrate config to current schema version.
+
+    Applies additive migrations in order. Never removes user data.
+    """
+    version = data.get("_schema_version", 0)
+
+    if version < 1:
+        data["_schema_version"] = 1
+
+    return data
+
+
 def load_config() -> Config:
     """Load configuration from config.json.
-    
+
     Returns:
         Config object with repository and settings data.
-    
+
     Raises:
         FileNotFoundError: If config.json doesn't exist.
         json.JSONDecodeError: If config.json is invalid.
     """
     config_path = get_config_path()
-    
+
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    
+
     with open(config_path) as f:
         data = json.load(f)
+
+    data = migrate_config(data)
     
     repositories = []
     for repo in data.get("repositories", []):
@@ -188,15 +202,18 @@ def get_ssh_key_dir() -> Path:
 def save_default_config() -> None:
     """Save default configuration file if it doesn't exist."""
     config_path = get_config_path()
-    
+
     if config_path.exists():
         return
-    
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
     with open(config_path, "w") as f:
         f.write(DEFAULT_CONFIG)
-    
-    # Create data directory
+
+    # Create data and backups directories
     get_data_dir()
+    (CONFIG_DIR / "backups").mkdir(parents=True, exist_ok=True)
 
 
 def extract_ssh_host(ssh_url: str) -> str:
@@ -350,16 +367,20 @@ def test_https_connection(https_url: str) -> tuple[bool, str]:
     max_attempts = 3
     sleep_between_retries = 2
 
+    ls_env = os.environ.copy()
+    ls_env["GIT_TERMINAL_PROMPT"] = "0"
+
     for attempt in range(1, max_attempts + 1):
         try:
             # Use git ls-remote to test connection without cloning
             cmd = ["git", "ls-remote", "--exit-code", https_url, "HEAD"]
-            
+
             result = run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=15
+                timeout=15,
+                env=ls_env,
             )
 
             if result.returncode == 0:
@@ -499,14 +520,11 @@ def fetch_git_log(
     temp_dir = Path(tempfile.mkdtemp(prefix="git_tracker_"))
     
     try:
-        # Clone repository
-        clone_cmd = ["git", "clone", "--bare", url, str(temp_dir)]
-
-        # Configure environment based on URL type
+        # Configure environment
         clone_env = os.environ.copy()
-        
+        clone_env["GIT_TERMINAL_PROMPT"] = "0"
+
         if is_ssh:
-            # Use custom SSH key if provided
             if ssh_key_dir and ssh_key_dir.exists():
                 ssh_key = ssh_key_dir / "id_rsa"
                 if ssh_key.exists():
@@ -515,10 +533,19 @@ def fetch_git_log(
                     clone_env["GIT_SSH_COMMAND"] = "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"
             else:
                 clone_env["GIT_SSH_COMMAND"] = "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"
-        # For HTTPS, use default environment (no special SSH configuration)
+
+        # Treeless bare clone — skips blobs, keeps commit history + tree metadata
+        # numstat works because line counts are in commit objects, not blobs
+        clone_cmd = [
+            "git", "clone", "--bare", "--filter=blob:none",
+            url, str(temp_dir),
+        ]
 
         try:
-            clone_result = run(clone_cmd, capture_output=True, text=True, env=clone_env, check=True)
+            run(clone_cmd, capture_output=True, text=True,
+                env=clone_env, check=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Clone timed out after 300s for {url}")
         except CalledProcessError as e:
             raise RuntimeError(f"Failed to clone repository: {e.stderr}") from e
 
@@ -533,6 +560,10 @@ def fetch_git_log(
         all_commits: list[CommitStats] = []
         cutoff_date = datetime.now().astimezone() - timedelta(days=num_days)
 
+        since_date = (
+            datetime.now().astimezone() - timedelta(days=num_days + 1)
+        ).strftime("%Y-%m-%d")
+
         for branch_name in branches:
             # Fetch git log from cloned repo
             git_format = "%H|%an|%ae|%ad|%s"
@@ -544,6 +575,7 @@ def fetch_git_log(
                 "--date=iso",
                 "--numstat",
                 "--no-merges",
+                f"--since={since_date}",
             ]
 
             # Add branch to the command
@@ -581,9 +613,31 @@ def fetch_git_log(
             commit.spent_time = ""
             commit.approximate = False
 
+        # Fetch one commit before the window for spent_time reference
+        prev_timestamp: datetime | None = None
+        if all_commits:
+            # Subtract 1s so --before excludes the oldest commit itself
+            before_ts = (all_commits[0].timestamp - timedelta(seconds=1)).isoformat()
+            for branch_name in branches:
+                prev_cmd = [
+                    "git", "--git-dir", str(temp_dir),
+                    "log", "-1", "--format=%ad", "--date=iso",
+                    f"--before={before_ts}", "--no-merges",
+                    branch_name,
+                ]
+                try:
+                    prev_result = run(prev_cmd, capture_output=True, text=True, check=True)
+                    date_str = prev_result.stdout.strip()
+                    if date_str:
+                        ts = datetime.fromisoformat(date_str)
+                        if prev_timestamp is None or ts > prev_timestamp:
+                            prev_timestamp = ts
+                        break
+                except (CalledProcessError, ValueError):
+                    continue
+
         # Calculate spent_time across all commits (chronological order)
         max_workday = timedelta(hours=8)
-        prev_timestamp: datetime | None = None
         for commit in all_commits:
             if prev_timestamp:
                 delta = commit.timestamp - prev_timestamp
@@ -594,9 +648,9 @@ def fetch_git_log(
                     commit.spent_time = _format_delta(delta)
             prev_timestamp = commit.timestamp
 
-        # Default empty spent_time on first commit
+        # Default empty spent_time on first commit (no earlier commit exists)
         if all_commits and not all_commits[0].spent_time:
-            all_commits[0].spent_time = "0d0h0m"
+            all_commits[0].spent_time = "-"
 
         # Filter to output window (drop the context day)
         all_commits = [c for c in all_commits if c.timestamp >= output_cutoff]
@@ -747,6 +801,7 @@ def write_stats(commits: list[CommitStats], output_file: Path) -> None:
     """
     data = [
         {
+            "commit_hash": c.commit_hash,
             "git_name": c.git_name,
             "username": c.username,
             "email": c.email,
@@ -886,6 +941,7 @@ def process_all_repos(config: Config, num_days: int | None = None, approximate: 
             # Convert to dict for JSON serialization
             results[repo.name] = [
                 {
+                    "commit_hash": c.commit_hash,
                     "git_name": c.git_name,
                     "username": c.username,
                     "email": c.email,
@@ -1032,6 +1088,7 @@ def main() -> dict[str, list[dict]]:
         return {
             repo.name: [
                 {
+                    "commit_hash": c.commit_hash,
                     "git_name": c.git_name,
                     "username": c.username,
                     "email": c.email,
