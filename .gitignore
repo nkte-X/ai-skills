@@ -9,12 +9,21 @@ CLAUDE.md
 __pycache__/
 test_*
 .dev/
+.venv/
 
+# secrets / credentials
 config.json
 !config-example.json
+!config.template.json
+*.env
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
 
 # git tracker
-git_tracker/git_tracker/data/*
+
 
 # other repos
 agent-manager/
